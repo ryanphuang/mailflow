@@ -1,4 +1,5 @@
-from AppKit import NSAlternateKeyMask, NSApplication, NSMenuItem
+from AppKit import NSAlternateKeyMask, NSApplication, NSMenuItem, \
+        NSLog, NSCommandKeyMask, NSUserDefaults, NSOffState, NSOnState
 import objc
 import re
 
@@ -54,6 +55,16 @@ def swizzle(classname, selector):
         return wrapper
     return decorator
 
+class FlowMenuFinder:
+    index = -1
+
+    @staticmethod
+    def get(application):
+        if FlowMenuFinder.index < 0:
+            return None
+        editmenu = application.mainMenu().itemAtIndex_(2).submenu()
+        # return editmenu.itemWithTitle_('Flow Text')
+        return editmenu.itemAtIndex_(FlowMenuFinder.index)
 
 class ComposeViewController(Category('ComposeViewController')):
     @swizzle('ComposeViewController', '_finishLoadingEditor')
@@ -71,22 +82,23 @@ class ComposeViewController(Category('ComposeViewController')):
                 blockquotes.item_(index).removeStrayLinefeeds()
 
         if self.messageType() in [1, 2, 8]:
-            view.moveToBeginningOfDocument_(None)
-            view.moveToEndOfParagraphAndModifySelection_(None)
-            view.moveForwardAndModifySelection_(None)
-            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                'Decrease', 'changeQuoteLevel:', '')
-            item.setTag_(-1)
-            view.changeQuoteLevel_(item)
+            if self._fixAttribution:
+                view.moveToBeginningOfDocument_(None)
+                view.moveToEndOfParagraphAndModifySelection_(None)
+                view.moveForwardAndModifySelection_(None)
+                item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    'Decrease', 'changeQuoteLevel:', '')
+                item.setTag_(-1)
+                view.changeQuoteLevel_(item)
 
-            attribution = view.selectedDOMRange().stringValue()
-            attribution = attribution.rsplit(u',', 1)[-1].lstrip()
-            if view.isAutomaticTextReplacementEnabled():
-                view.setAutomaticTextReplacementEnabled_(False)
-                view.insertText_(attribution)
-                view.setAutomaticTextReplacementEnabled_(True)
-            else:
-                view.insertText_(attribution)
+                attribution = view.selectedDOMRange().stringValue()
+                attribution = attribution.rsplit(u',', 1)[-1].lstrip()
+                if view.isAutomaticTextReplacementEnabled():
+                    view.setAutomaticTextReplacementEnabled_(False)
+                    view.insertText_(attribution)
+                    view.setAutomaticTextReplacementEnabled_(True)
+                else:
+                    view.insertText_(attribution)
 
             signature = document.getElementById_('AppleMailSignature')
             if signature:
@@ -191,12 +203,13 @@ class EditingMessageWebView(Category('EditingMessageWebView')):
 
         self.undoManager().endUndoGrouping()
 
+    def flowText(self):
+        self._flow_menuitem.setState_(not self._flow_menuitem.state())
 
 class MCMessage(Category('MCMessage')):
     @swizzle('MCMessage', 'forwardedMessagePrefixWithSpacer:')
     def forwardedMessagePrefixWithSpacer_(self, old, *args):
         return u''
-
 
 class MCMessageGenerator(Category('MCMessageGenerator')):
     @swizzle('MCMessageGenerator', '_encodeDataForMimePart:withPartData:')
@@ -218,7 +231,12 @@ class MCMessageGenerator(Category('MCMessageGenerator')):
     @swizzle('MCMessageGenerator',
              '_newPlainTextPartWithAttributedString:partData:')
     def _newPlainTextPartWithAttributedString_partData_(self, old, *args):
-        event = NSApplication.sharedApplication().currentEvent()
+        application = NSApplication.sharedApplication()
+        flowmenu = FlowMenuFinder.get(application)
+        if flowmenu and flowmenu.state() == NSOffState:
+            NSLog('Flow text disabled!')
+            return old(self, *args)
+        event = application.currentEvent()
         result = old(self, *args)
         if event and event.modifierFlags() & NSAlternateKeyMask:
             return result
@@ -246,7 +264,12 @@ class MCMimePart(Category('MCMimePart')):
 class MessageViewController(Category('MessageViewController')):
     @swizzle('MessageViewController', 'forward:')
     def forward_(self, old, *args):
-        event = NSApplication.sharedApplication().currentEvent()
+        application = NSApplication.sharedApplication()
+        flowmenu = FlowMenuFinder.get(application)
+        if flowmenu and flowmenu.state() == NSOffState:
+            NSLog('Flow text disabled!')
+            return old(self, *args)
+        event = application.currentEvent()
         if event and event.modifierFlags() & NSAlternateKeyMask:
             return old(self, *args)
         return self._messageViewer().forwardAsAttachment_(*args)
@@ -255,7 +278,12 @@ class MessageViewController(Category('MessageViewController')):
 class MessageViewer(Category('MessageViewer')):
     @swizzle('MessageViewer', 'forwardMessage:')
     def forwardMessage_(self, old, *args):
-        event = NSApplication.sharedApplication().currentEvent()
+        application = NSApplication.sharedApplication()
+        flowmenu = FlowMenuFinder.get(application)
+        if flowmenu and flowmenu.state() == NSOffState:
+            NSLog('Flow text disabled!')
+            return old(self, *args)
+        event = application.currentEvent()
         if event and event.modifierFlags() & NSAlternateKeyMask:
             return old(self, *args)
         return self.forwardAsAttachment_(*args)
@@ -264,7 +292,12 @@ class MessageViewer(Category('MessageViewer')):
 class SingleMessageViewer(Category('SingleMessageViewer')):
     @swizzle('SingleMessageViewer', 'forwardMessage:')
     def forwardMessage_(self, old, *args):
-        event = NSApplication.sharedApplication().currentEvent()
+        application = NSApplication.sharedApplication()
+        flowmenu = FlowMenuFinder.get(application)
+        if flowmenu and flowmenu.state() == NSOffState:
+            NSLog('Flow text disabled!')
+            return old(self, *args)
+        event = application.currentEvent()
         if event and event.modifierFlags() & NSAlternateKeyMask:
             return old(self, *args)
         return self.forwardAsAttachment_(*args)
@@ -273,4 +306,21 @@ class SingleMessageViewer(Category('SingleMessageViewer')):
 class MailFlow(Class('MVMailBundle')):
     @classmethod
     def initialize(self):
+        application = NSApplication.sharedApplication()
         self.registerBundle()
+
+        editmenu = application.mainMenu().itemAtIndex_(2).submenu()
+        editmenu.addItem_(NSMenuItem.separatorItem())
+
+        mask = NSCommandKeyMask | NSAlternateKeyMask
+        flowmenu = editmenu.addItemWithTitle_action_keyEquivalent_('Flow Text',
+            'flowText', '=')
+        flowmenu.setState_(NSOnState)
+        flowmenu.setKeyEquivalentModifierMask_(mask)
+        EditingMessageWebView._flow_menuitem = flowmenu
+        FlowMenuFinder.index = editmenu.indexOfItem_(flowmenu)
+
+        defaults = NSUserDefaults.standardUserDefaults()
+        defaults = defaults.dictionaryForKey_('MailFlow') or {}
+        ComposeViewController._fixAttribution = defaults.get('FixAttribution', True)
+        NSLog('Loaded MailFlow')
