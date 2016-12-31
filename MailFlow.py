@@ -2,6 +2,7 @@ from AppKit import NSAlternateKeyMask, NSApplication, NSMenuItem, \
         NSLog, NSCommandKeyMask, NSUserDefaults, NSOffState, NSOnState
 import objc
 import re
+import textwrap
 
 def Category(classname):
     return objc.Category(objc.lookUpClass(classname))
@@ -9,7 +10,23 @@ def Category(classname):
 def Class(classname):
     return objc.lookUpClass(classname)
 
-def flow(text, width = 77):
+def swizzle(classname, selector):
+    def decorator(function):
+        cls = objc.lookUpClass(classname)
+        old = cls.instanceMethodForSelector_(selector)
+        if old.isClassMethod:
+            old = cls.methodForSelector_(selector)
+        def wrapper(self, *args, **kwargs):
+            return function(self, old, *args, **kwargs)
+        new = objc.selector(wrapper, selector = old.selector,
+                            signature = old.signature,
+                            isClassMethod = old.isClassMethod)
+        objc.classAddMethod(cls, selector, new)
+        return wrapper
+    return decorator
+
+def flow(text):
+    width = EditingMessageWebView._wrapWidth + 1
     quote, indent = re.match(r'(>+ ?|)(\s*)', text, re.UNICODE).groups()
     prefix = len(quote)
     if text[prefix:] == u'-- ':
@@ -40,21 +57,18 @@ def flow(text, width = 77):
             text, cursor = quote + text[cursor:], cursor - prefix
         breaks = [offset - cursor for offset in breaks[index + 1:]]
 
-def swizzle(classname, selector):
-    def decorator(function):
-        cls = objc.lookUpClass(classname)
-        old = cls.instanceMethodForSelector_(selector)
-        if old.isClassMethod:
-            old = cls.methodForSelector_(selector)
-        def wrapper(self, *args, **kwargs):
-            return function(self, old, *args, **kwargs)
-        new = objc.selector(wrapper, selector = old.selector,
-                            signature = old.signature,
-                            isClassMethod = old.isClassMethod)
-        objc.classAddMethod(cls, selector, new)
-        return wrapper
-    return decorator
-
+def wrap(text, level):
+    initial = subsequent = len(text) - len(text.lstrip())
+    width = EditingMessageWebView._wrapWidth
+    if EditingMessageWebView._bulletLists and initial > 0:
+        if text.lstrip().startswith(('- ', '+ ', '* ')):
+            subsequent += 2
+    return textwrap.fill(' '.join(text.split()),
+                         width - level - 1 if level > 0 else width,
+                         break_long_words = False,
+                         break_on_hyphens = False,
+                         initial_indent = ' ' * initial,
+                         subsequent_indent = ' ' * subsequent)
 class FlowMenuFinder:
     index = -1
 
@@ -63,8 +77,17 @@ class FlowMenuFinder:
         if FlowMenuFinder.index < 0:
             return None
         editmenu = application.mainMenu().itemAtIndex_(2).submenu()
-        # return editmenu.itemWithTitle_('Flow Text')
         return editmenu.itemAtIndex_(FlowMenuFinder.index)
+
+class WrapMenuFinder:
+    index = -1
+
+    @staticmethod
+    def get(application):
+        if WrapMenuFinder.index < 0:
+            return None
+        editmenu = application.mainMenu().itemAtIndex_(2).submenu()
+        return editmenu.itemAtIndex_(WrapMenuFinder.index)
 
 class ComposeViewController(Category('ComposeViewController')):
     @swizzle('ComposeViewController', '_finishLoadingEditor')
@@ -204,7 +227,166 @@ class EditingMessageWebView(Category('EditingMessageWebView')):
         self.undoManager().endUndoGrouping()
 
     def flowText(self):
+        self._wrap_menuitem.setState_(NSOffState) # disable wrap
         self._flow_menuitem.setState_(not self._flow_menuitem.state())
+
+        # The actual flow is done when the message is sent out...
+
+    def wrapParagraph(self):
+        # Note the quote level of the current paragraph and the location of
+        # the end of the message to avoid attempts to move beyond it.
+
+        self.moveToEndOfDocumentAndModifySelection_(None)
+        last = self.selectedRange().location + self.selectedRange().length
+
+        self.moveToBeginningOfParagraph_(None)
+        self.selectParagraph_(None)
+        level = self.quoteLevelAtStartOfSelection()
+
+        # If we are on a blank line, move down to the start of the next
+        # paragraph block and finish.
+
+        if not self.selectedText().strip():
+            while True:
+                self.moveDown_(None)
+                self.selectParagraph_(None)
+                location = self.selectedRange().location
+                if location + self.selectedRange().length >= last:
+                    self.moveToEndOfParagraph_(None)
+                    return
+                if self.selectedText().strip():
+                    self.moveToBeginningOfParagraph_(None)
+                    return
+
+        # Otherwise move to the start of this paragraph block, working
+        # upward until we hit the start of the message, a blank line or a
+        # change in quote level.
+
+        while self.selectedRange().location > 0:
+            self.moveUp_(None)
+            if self.quoteLevelAtStartOfSelection() != level:
+                self.moveDown_(None)
+                break
+            self.selectParagraph_(None)
+            if not self.selectedText().strip():
+                self.moveDown_(None)
+                break
+        self.moveToBeginningOfParagraph_(None)
+
+        # Insert a temporary placeholder space character to avoid any
+        # assumptions about Mail.app's strange and somewhat unpredictable
+        # handling of newlines between block elements.
+
+        self.insertText_(' ')
+        self.moveToEndOfParagraphAndModifySelection_(None)
+
+        # Now extend the selection forward line-by-line until we hit a blank
+        # line, a change in quote level or the end of the message.
+
+        affinity = self.selectionAffinity()
+        selection = self.selectedDOMRange()
+        while True:
+            location = self.selectedRange().location
+            if location + self.selectedRange().length >= last:
+                break
+            self.moveDown_(None)
+            self.moveToEndOfParagraphAndModifySelection_(None)
+            if self.quoteLevelAtStartOfSelection() != level:
+                break
+            if not self.selectedText().strip():
+                break
+            selection.setEnd__(self.selectedDOMRange().endContainer(),
+                               self.selectedDOMRange().endOffset())
+        self.setSelectedDOMRange_affinity_(selection, affinity)
+
+        # Finally, extend the selection forward to encompass any blank lines
+        # following the paragraph block, regardless of quote level. Store
+        # the minimum quote level of this paragraph block and the next.
+
+        while True:
+            location = self.selectedRange().location
+            if location + self.selectedRange().length >= last:
+                minimum = 0
+                break
+            self.moveDown_(None)
+            self.moveToBeginningOfParagraph_(None)
+            self.moveToEndOfParagraphAndModifySelection_(None)
+            if self.selectedText().strip():
+                minimum = min(self.quoteLevelAtStartOfSelection(), level)
+                break
+            selection.setEnd__(self.selectedDOMRange().endContainer(),
+                               self.selectedDOMRange().endOffset())
+        self.setSelectedDOMRange_affinity_(selection, affinity)
+
+        # Re-fill the text allowing for quote level and retaining block
+        # indentation, then insert it to replace the selection.
+
+        text = wrap(self.selectedText().expandtabs(), level) + '\n'
+        self.insertTextWithoutReplacement_(text)
+
+        # Reduce the quote level of the trailing blank line if necessary,
+        # then remove the placeholder character and position the cursor at
+        # the start of the next paragraph block.
+
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            'Decrease', 'changeQuoteLevel:', '')
+        item.setTag_(-1)
+        for _ in xrange(level - minimum):
+            self.changeQuoteLevel_(item)
+
+        selection = self.selectedDOMRange()
+        for _ in xrange(text.count('\n')):
+            self.moveUp_(None)
+            self.moveToBeginningOfParagraph_(None)
+        self.deleteForward_(None)
+        self.setSelectedDOMRange_affinity_(selection, affinity)
+        self.moveForward_(None)
+
+    def wrapText(self):
+        self._flow_menuitem.setState_(NSOffState) # disable flow
+        self._wrap_menuitem.setState_(NSOnState) # enable wrap
+
+        # MailWrap only works correctly on plain text messages, so ignore
+        # any requests to format paragraphs in rich-text/HTML messages.
+
+        if self.contentElement().className() != 'ApplePlainTextBody':
+            return
+
+        # If we have a selection, format all paragraph blocks which overlap
+        # it. Otherwise, format the paragraph block containing the cursor.
+        # Combine the operation into a single undo group for UI purposes.
+
+        self.undoManager().beginUndoGrouping()
+        if self.selectedRange().length == 0:
+            self.selectAll_(None)
+            # self.wrapParagraph()
+            # self.moveToEndOfDocumentAndModifySelection_(None)
+        # else:
+        last = self.selectedRange().length
+        self.moveToEndOfDocumentAndModifySelection_(None)
+        last = self.selectedRange().length - last
+        while self.selectedRange().length > last:
+            self.wrapParagraph()
+            self.moveToEndOfDocumentAndModifySelection_(None)
+        if self.selectedRange().length > 0:
+            self.moveBackward_(None)
+        else:
+            self.deleteBackward_(None)
+        self.undoManager().endUndoGrouping()
+
+    def insertTextWithoutReplacement_(self, text):
+        if self.isAutomaticTextReplacementEnabled():
+            self.setAutomaticTextReplacementEnabled_(False)
+            self.insertText_(text)
+            self.setAutomaticTextReplacementEnabled_(True)
+        else:
+            self.insertText_(text)
+
+    def quoteLevelAtStartOfSelection(self):
+        return self.selectedDOMRange().startContainer().quoteLevel()
+
+    def selectedText(self):
+        return self.selectedDOMRange().stringValue() or ''
 
 class MCMessage(Category('MCMessage')):
     @swizzle('MCMessage', 'forwardedMessagePrefixWithSpacer:')
@@ -320,7 +502,18 @@ class MailFlow(Class('MVMailBundle')):
         EditingMessageWebView._flow_menuitem = flowmenu
         FlowMenuFinder.index = editmenu.indexOfItem_(flowmenu)
 
+        mask = NSCommandKeyMask | NSAlternateKeyMask
+        wrapmenu = editmenu.addItemWithTitle_action_keyEquivalent_('Wrap Text',
+            'wrapText', '\\')
+        wrapmenu.setKeyEquivalentModifierMask_(mask)
+        EditingMessageWebView._wrap_menuitem = wrapmenu
+        WrapMenuFinder.index = editmenu.indexOfItem_(wrapmenu)
+
         defaults = NSUserDefaults.standardUserDefaults()
         defaults = defaults.dictionaryForKey_('MailFlow') or {}
         ComposeViewController._fixAttribution = defaults.get('FixAttribution', True)
+        EditingMessageWebView._bulletLists = defaults.get('BulletLists', True)
+        EditingMessageWebView._indentWidth = int(defaults.get('IndentWidth', 2))
+        EditingMessageWebView._wrapWidth = int(defaults.get('WrapWidth', 76))
+
         NSLog('Loaded MailFlow')
