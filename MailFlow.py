@@ -1,5 +1,5 @@
-from AppKit import NSAlternateKeyMask, NSApplication, NSMenuItem, \
-        NSLog, NSCommandKeyMask, NSUserDefaults, NSOffState, NSOnState
+from AppKit import NSAlternateKeyMask, NSApplication, NSBundle, NSMenuItem, \
+        NSLog, NSCommandKeyMask, NSUserDefaults, NSOffState, NSOnState, NSObject
 import objc
 import re
 import textwrap
@@ -25,8 +25,45 @@ def swizzle(classname, selector):
         return wrapper
     return decorator
 
-def flow(text):
-    width = EditingMessageWebView._wrapWidth + 1
+class DefaultsProxy:
+    def __init__(self, typename, delegate):
+        self.typename = typename
+        self.delegate = delegate
+
+    def __getitem__(self, item):
+        return {
+            'bool'   : self.delegate.boolForKey_,
+            'int'    : self.delegate.integerForKey_,
+            'string' : self.delegate.stringForKey_,
+            'object' : self.delegate.objectForKey_,
+        }[self.typename](item)
+
+    def __setitem__(self, item, value):
+        {
+            'int'    : self.delegate.setInteger_forKey_,
+            'bool'   : self.delegate.setBool_forKey_,
+            'string' : self.delegate.setObject_forKey_,
+            'object' : self.delegate.setObject_forKey_,
+        }[self.typename](value, item)
+
+class NSUserDefaults(Category('NSUserDefaults')):
+    @property
+    def bool(self):
+        return DefaultsProxy('bool', self)
+
+    @property
+    def int(self):
+        return DefaultsProxy('int', self)
+
+    @property
+    def string(self):
+        return DefaultsProxy('string', self)
+
+    @property
+    def object(self):
+        return DefaultsProxy('object', self)
+
+def flow(text, width):
     quote, indent = re.match(r'(>+ ?|)(\s*)', text, re.UNICODE).groups()
     prefix = len(quote)
     if text[prefix:] == u'-- ':
@@ -57,10 +94,10 @@ def flow(text):
             text, cursor = quote + text[cursor:], cursor - prefix
         breaks = [offset - cursor for offset in breaks[index + 1:]]
 
-def wrap(text, level):
+def wrap(text, level, width, detect_bullet_list):
+    NSLog('MailFlow to wrap text')
     initial = subsequent = len(text) - len(text.lstrip())
-    width = EditingMessageWebView._wrapWidth
-    if EditingMessageWebView._bulletLists and initial > 0:
+    if detect_bullet_list and initial > 0:
         if text.lstrip().startswith(('- ', '+ ', '* ')):
             subsequent += 2
     return textwrap.fill(' '.join(text.split()),
@@ -69,27 +106,13 @@ def wrap(text, level):
                          break_on_hyphens = False,
                          initial_indent = ' ' * initial,
                          subsequent_indent = ' ' * subsequent)
-class FlowMenuFinder:
-    index = -1
-
-    @staticmethod
-    def get(application):
-        if FlowMenuFinder.index < 0:
-            return None
-        editmenu = application.mainMenu().itemAtIndex_(2).submenu()
-        return editmenu.itemAtIndex_(FlowMenuFinder.index)
-
-class WrapMenuFinder:
-    index = -1
-
-    @staticmethod
-    def get(application):
-        if WrapMenuFinder.index < 0:
-            return None
-        editmenu = application.mainMenu().itemAtIndex_(2).submenu()
-        return editmenu.itemAtIndex_(WrapMenuFinder.index)
 
 class ComposeViewController(Category('ComposeViewController')):
+
+    @classmethod
+    def registerWithApplication(cls, app):
+        cls.app = app
+
     @swizzle('ComposeViewController', '_finishLoadingEditor')
     def _finishLoadingEditor(self, old):
         result = old(self)
@@ -105,7 +128,7 @@ class ComposeViewController(Category('ComposeViewController')):
                 blockquotes.item_(index).removeStrayLinefeeds()
 
         if self.messageType() in [1, 2, 8]:
-            if self._fixAttribution:
+            if self.app.is_fix_attribution:
                 view.moveToBeginningOfDocument_(None)
                 view.moveToEndOfParagraphAndModifySelection_(None)
                 view.moveForwardAndModifySelection_(None)
@@ -164,6 +187,11 @@ class ComposeViewController(Category('ComposeViewController')):
 
 
 class EditingMessageWebView(Category('EditingMessageWebView')):
+
+    @classmethod
+    def registerWithApplication(cls, app):
+        cls.app = app
+
     @swizzle('EditingMessageWebView', 'decreaseIndentation:')
     def decreaseIndentation_(self, original, sender, indent = 2):
         if self.contentElement().className() != 'ApplePlainTextBody':
@@ -226,15 +254,11 @@ class EditingMessageWebView(Category('EditingMessageWebView')):
 
         self.undoManager().endUndoGrouping()
 
-    def flowText(self):
-        self._wrap_menuitem.setState_(NSOffState) # disable wrap
-        self._flow_menuitem.setState_(not self._flow_menuitem.state())
-
-        # The actual flow is done when the message is sent out...
-
     def wrapParagraph(self):
         # Note the quote level of the current paragraph and the location of
         # the end of the message to avoid attempts to move beyond it.
+
+        NSLog('MailFlow wrap paragraph')
 
         self.moveToEndOfDocumentAndModifySelection_(None)
         last = self.selectedRange().location + self.selectedRange().length
@@ -253,15 +277,18 @@ class EditingMessageWebView(Category('EditingMessageWebView')):
                 location = self.selectedRange().location
                 if location + self.selectedRange().length >= last:
                     self.moveToEndOfParagraph_(None)
+                    NSLog('MailFlow wrap paragraph done 1')
                     return
                 if self.selectedText().strip():
                     self.moveToBeginningOfParagraph_(None)
+                    NSLog('MailFlow wrap paragraph done 2')
                     return
 
         # Otherwise move to the start of this paragraph block, working
         # upward until we hit the start of the message, a blank line or a
         # change in quote level.
 
+        NSLog('MailFlow paragraph start')
         while self.selectedRange().location > 0:
             self.moveUp_(None)
             if self.quoteLevelAtStartOfSelection() != level:
@@ -317,11 +344,15 @@ class EditingMessageWebView(Category('EditingMessageWebView')):
             selection.setEnd__(self.selectedDOMRange().endContainer(),
                                self.selectedDOMRange().endOffset())
         self.setSelectedDOMRange_affinity_(selection, affinity)
+        NSLog('MailFlow scanned paragraph: wrap width=%d, detect_bullet_list=%s' % (self.app.wrap_width, self.app.detect_bullet_list))
 
         # Re-fill the text allowing for quote level and retaining block
         # indentation, then insert it to replace the selection.
 
-        text = wrap(self.selectedText().expandtabs(), level) + '\n'
+        NSLog('MailFlow before wrap')
+        text = wrap(self.selectedText().expandtabs(), level, 
+                self.app.wrap_width, self.app.detect_bullet_list) + '\n'
+        NSLog('MailFlow done wrap')
         self.insertTextWithoutReplacement_(text)
 
         # Reduce the quote level of the trailing blank line if necessary,
@@ -342,11 +373,23 @@ class EditingMessageWebView(Category('EditingMessageWebView')):
         self.setSelectedDOMRange_affinity_(selection, affinity)
         self.moveForward_(None)
 
-    def wrapText(self):
-        self._flow_menuitem.setState_(NSOffState) # disable flow
-        self._wrap_menuitem.setState_(NSOnState) # enable wrap
+    def flowText_(self, sender):
+        self.app.is_flow_text = not sender.state()
+        self.app.menu.flow_menu_item.setState_(self.app.is_flow_text)
+        if self.app.is_flow_text:
+            self.app.is_wrap_text = False
+            self.app.menu.wrap_menu_item.setState_(NSOffState)
 
-        # MailWrap only works correctly on plain text messages, so ignore
+    def wrapText_(self, sender):
+        self.app.is_wrap_text = not sender.state()
+        self.app.menu.wrap_menu_item.setState_(self.app.is_wrap_text)
+        if self.app.is_wrap_text:
+            self.app.is_flow_text = False
+            self.app.menu.flow_menu_item.setState_(NSOffState)
+
+    def wrapOnce_(self, sender):
+        self.app.menu.wrap_once_menu_item.setState_(sender.state())
+        # Wrap text only works correctly on plain text messages, so ignore
         # any requests to format paragraphs in rich-text/HTML messages.
 
         if self.contentElement().className() != 'ApplePlainTextBody':
@@ -394,6 +437,11 @@ class MCMessage(Category('MCMessage')):
         return u''
 
 class MCMessageGenerator(Category('MCMessageGenerator')):
+
+    @classmethod
+    def registerWithApplication(cls, app):
+        cls.app = app
+
     @swizzle('MCMessageGenerator', '_encodeDataForMimePart:withPartData:')
     def _encodeDataForMimePart_withPartData_(self, old, part, data):
         if part.type() != 'text' or part.subtype() != 'plain':
@@ -412,13 +460,11 @@ class MCMessageGenerator(Category('MCMessageGenerator')):
 
     @swizzle('MCMessageGenerator',
              '_newPlainTextPartWithAttributedString:partData:')
+
     def _newPlainTextPartWithAttributedString_partData_(self, old, *args):
-        application = NSApplication.sharedApplication()
-        flowmenu = FlowMenuFinder.get(application)
-        if flowmenu and flowmenu.state() == NSOffState:
-            NSLog('Flow text disabled!')
+        if not self.app.should_wrap:
             return old(self, *args)
-        event = application.currentEvent()
+        event = NSApplication.sharedApplication().currentEvent()
         result = old(self, *args)
         if event and event.modifierFlags() & NSAlternateKeyMask:
             return result
@@ -426,11 +472,12 @@ class MCMessageGenerator(Category('MCMessageGenerator')):
         charset = result.bodyParameterForKey_('charset') or 'utf-8'
         data = args[1].objectForKey_(result)
         lines = bytes(data).decode(charset).split('\n')
-        lines = [line for text in lines for line in flow(text)]
+        lines = [line for text in lines for line in flow(text, self.app.wrap_width + 1)]
         data.setData_(buffer(u'\n'.join(lines).encode(charset)))
 
         result.setBodyParameter_forKey_('yes', 'delsp')
-        result.setBodyParameter_forKey_('flowed', 'format')
+        if self.app.is_flow_text:
+            result.setBodyParameter_forKey_('flowed', 'format')
         return result
 
 
@@ -444,76 +491,174 @@ class MCMimePart(Category('MCMimePart')):
 
 
 class MessageViewController(Category('MessageViewController')):
+    @classmethod
+    def registerWithApplication(cls, app):
+        cls.app = app
+
     @swizzle('MessageViewController', 'forward:')
     def forward_(self, old, *args):
-        application = NSApplication.sharedApplication()
-        flowmenu = FlowMenuFinder.get(application)
-        if flowmenu and flowmenu.state() == NSOffState:
-            NSLog('Flow text disabled!')
+        if not self.app.should_wrap:
             return old(self, *args)
-        event = application.currentEvent()
+        event = NSApplication.sharedApplication().currentEvent()
         if event and event.modifierFlags() & NSAlternateKeyMask:
             return old(self, *args)
         return self._messageViewer().forwardAsAttachment_(*args)
 
-
 class MessageViewer(Category('MessageViewer')):
+
+    @classmethod
+    def registerWithApplication(cls, app):
+        cls.app = app
+
     @swizzle('MessageViewer', 'forwardMessage:')
     def forwardMessage_(self, old, *args):
-        application = NSApplication.sharedApplication()
-        flowmenu = FlowMenuFinder.get(application)
-        if flowmenu and flowmenu.state() == NSOffState:
-            NSLog('Flow text disabled!')
+        if not self.app.should_wrap:
             return old(self, *args)
-        event = application.currentEvent()
+        event = NSApplication.sharedApplication().currentEvent()
         if event and event.modifierFlags() & NSAlternateKeyMask:
             return old(self, *args)
         return self.forwardAsAttachment_(*args)
-
 
 class SingleMessageViewer(Category('SingleMessageViewer')):
+    @classmethod
+    def registerWithApplication(cls, app):
+        cls.app = app
+
     @swizzle('SingleMessageViewer', 'forwardMessage:')
     def forwardMessage_(self, old, *args):
-        application = NSApplication.sharedApplication()
-        flowmenu = FlowMenuFinder.get(application)
-        if flowmenu and flowmenu.state() == NSOffState:
-            NSLog('Flow text disabled!')
+        if not self.app.should_wrap:
             return old(self, *args)
-        event = application.currentEvent()
+        event = NSApplication.sharedApplication().currentEvent()
         if event and event.modifierFlags() & NSAlternateKeyMask:
             return old(self, *args)
         return self.forwardAsAttachment_(*args)
 
+class App(object):
+    def __init__(self, version):
+        self.version = version
+        self.prefs = NSUserDefaults.standardUserDefaults()
+        self.prefs.registerDefaults_(dict(
+            FlowText = False,
+            WrapText = False,
+            WrapOnce = False,
+            FixAttribution = True,
+            BulletLists = True,
+            IndentWidth = 2,
+            WrapWidth = 76,
+        ))
+        self.menu = MailFlowMenu.alloc().initWithApp_(self).inject()
 
-class MailFlow(Class('MVMailBundle')):
-    @classmethod
-    def initialize(self):
+    @property
+    def should_wrap(self):
+        return self.is_flow_text or self.is_wrap_text
+
+    @property
+    def is_flow_text(self):
+        return self.prefs.bool["FlowText"]
+
+    @is_flow_text.setter
+    def is_flow_text(self, value):
+        self.prefs.bool["FlowText"] = value
+
+    @property
+    def is_wrap_text(self):
+        return self.prefs.bool["WrapText"]
+
+    @is_wrap_text.setter
+    def is_wrap_text(self, value):
+        self.prefs.bool["WrapText"] = value
+
+    @property
+    def is_fix_attribution(self):
+        return self.prefs.bool["FixAttribution"]
+
+    @is_fix_attribution.setter
+    def is_fix_attribution(self, value):
+        self.prefs.bool["FixAttribution"] = value
+
+    @property
+    def detect_bullet_list(self):
+        return self.prefs.bool["BulletLists"]
+
+    @detect_bullet_list.setter
+    def detect_bullet_list(self, value):
+        self.prefs.bool["BulletLists"] = value
+
+    @property
+    def indent_width(self):
+        return self.prefs.int["IndentWidth"]
+
+    @indent_width.setter
+    def indent_width(self, value):
+        self.prefs.int["IndentWidth"] = value
+
+    @property
+    def wrap_width(self):
+        return self.prefs.int["WrapWidth"]
+
+    @wrap_width.setter
+    def wrap_width(self, value):
+        self.prefs.int["WrapWidth"] = value
+
+class MailFlowMenu(NSObject):
+    def initWithApp_(self, app):
+        self = objc.super(MailFlowMenu, self).init()
+        if self is None:
+            return None
+        self.app = app
+        self.mainwindow = NSApplication.sharedApplication().mainWindow()
+        self.bundle = NSBundle.bundleWithIdentifier_('uk.me.cdw.MailFlow')
+        return self
+
+    def inject(self):
+        NSLog('Trying to inject menu in MailFlow')
+        self.retain()
         application = NSApplication.sharedApplication()
-        self.registerBundle()
-
         editmenu = application.mainMenu().itemAtIndex_(2).submenu()
         editmenu.addItem_(NSMenuItem.separatorItem())
 
         mask = NSCommandKeyMask | NSAlternateKeyMask
-        flowmenu = editmenu.addItemWithTitle_action_keyEquivalent_('Flow Text',
-            'flowText', '=')
-        flowmenu.setState_(NSOnState)
-        flowmenu.setKeyEquivalentModifierMask_(mask)
-        EditingMessageWebView._flow_menuitem = flowmenu
-        FlowMenuFinder.index = editmenu.indexOfItem_(flowmenu)
+        self.flow_menu_item = editmenu.addItemWithTitle_action_keyEquivalent_(
+            "Flow Text",
+            "flowText:", 
+            "=")
+        self.flow_menu_item.setKeyEquivalentModifierMask_(mask)
+        self.flow_menu_item.setToolTip_("Send flow format plain-text email")
+        self.flow_menu_item.setState_(self.app.is_flow_text)
 
         mask = NSCommandKeyMask | NSAlternateKeyMask
-        wrapmenu = editmenu.addItemWithTitle_action_keyEquivalent_('Wrap Text',
-            'wrapText', '\\')
-        wrapmenu.setKeyEquivalentModifierMask_(mask)
-        EditingMessageWebView._wrap_menuitem = wrapmenu
-        WrapMenuFinder.index = editmenu.indexOfItem_(wrapmenu)
+        self.wrap_menu_item = editmenu.addItemWithTitle_action_keyEquivalent_(
+            "Wrap Text",
+            "wrapText:", 
+            "\\")
+        self.wrap_menu_item.setKeyEquivalentModifierMask_(mask)
+        self.wrap_menu_item.setToolTip_("Wrap plain-text email")
+        self.wrap_menu_item.setState_(self.app.is_wrap_text)
 
-        defaults = NSUserDefaults.standardUserDefaults()
-        defaults = defaults.dictionaryForKey_('MailFlow') or {}
-        ComposeViewController._fixAttribution = defaults.get('FixAttribution', True)
-        EditingMessageWebView._bulletLists = defaults.get('BulletLists', True)
-        EditingMessageWebView._indentWidth = int(defaults.get('IndentWidth', 2))
-        EditingMessageWebView._wrapWidth = int(defaults.get('WrapWidth', 76))
+        mask = NSCommandKeyMask
+        self.wrap_once_menu_item = editmenu.addItemWithTitle_action_keyEquivalent_(
+            "Wrap Once",
+            "wrapOnce:", 
+            "\\")
+        self.wrap_once_menu_item.setKeyEquivalentModifierMask_(mask)
+        self.wrap_once_menu_item.setToolTip_("Wrap selected/all text once")
+        return self
+
+class MailFlow(Class('MVMailBundle')):
+    @classmethod
+    def initialize(self):
+        self.registerBundle()
+
+        bundle = NSBundle.bundleWithIdentifier_('uk.me.cdw.MailFlow')
+        version = bundle.infoDictionary().get('CFBundleVersion', '??')
+
+        app = App(version)
+
+        MCMessageGenerator.registerWithApplication(app)
+        MessageViewController.registerWithApplication(app)
+        MessageViewer.registerWithApplication(app)
+        SingleMessageViewer.registerWithApplication(app)
+        EditingMessageWebView.registerWithApplication(app)
+        ComposeViewController.registerWithApplication(app)
 
         NSLog('Loaded MailFlow')
