@@ -63,7 +63,7 @@ class NSUserDefaults(Category('NSUserDefaults')):
     def object(self):
         return DefaultsProxy('object', self)
 
-def flow(text, width):
+def flow(text, width, padspace=True):
     quote, indent = re.match(r'(>+ ?|)(\s*)', text, re.UNICODE).groups()
     prefix = len(quote)
     if text[prefix:] == u'-- ':
@@ -86,8 +86,10 @@ def flow(text, width):
         else:
             lines.append(text)
             return lines
-
-        lines.append(text[:cursor] + u' ')
+        if padspace:
+            lines.append(text[:cursor] + u' ')
+        else:
+            lines.append(text[:cursor])
         if not quote and text[cursor:].startswith(u'From '):
             text, cursor = u' ' + text[cursor:], cursor - 1
         else:
@@ -350,8 +352,7 @@ class EditingMessageWebView(Category('EditingMessageWebView')):
         # indentation, then insert it to replace the selection.
 
         NSLog('MailFlow before wrap')
-        text = wrap(self.selectedText().expandtabs(), level, 
-                self.app.wrap_width, self.app.detect_bullet_list) + '\n'
+        text = wrap(self.selectedText().expandtabs(), level, self.app.wrap_width, self.app.detect_bullet_list) + '\n'
         NSLog('MailFlow done wrap')
         self.insertTextWithoutReplacement_(text)
 
@@ -401,16 +402,16 @@ class EditingMessageWebView(Category('EditingMessageWebView')):
 
         self.undoManager().beginUndoGrouping()
         if self.selectedRange().length == 0:
-            self.selectAll_(None)
-            # self.wrapParagraph()
-            # self.moveToEndOfDocumentAndModifySelection_(None)
-        # else:
-        last = self.selectedRange().length
-        self.moveToEndOfDocumentAndModifySelection_(None)
-        last = self.selectedRange().length - last
-        while self.selectedRange().length > last:
+            # self.selectAll_(None)
             self.wrapParagraph()
             self.moveToEndOfDocumentAndModifySelection_(None)
+        else:
+            last = self.selectedRange().length
+            self.moveToEndOfDocumentAndModifySelection_(None)
+            last = self.selectedRange().length - last
+            while self.selectedRange().length > last:
+                self.wrapParagraph()
+                self.moveToEndOfDocumentAndModifySelection_(None)
         if self.selectedRange().length > 0:
             self.moveBackward_(None)
         else:
@@ -541,7 +542,7 @@ class App(object):
             FlowText = False,
             WrapText = False,
             WrapOnce = False,
-            FixAttribution = True,
+            FixAttribution = False,
             BulletLists = True,
             IndentWidth = 2,
             WrapWidth = 76,
