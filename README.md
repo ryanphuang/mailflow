@@ -7,6 +7,8 @@ quoted-printable transfer encoding. Quoting and attribution when replying is
 also improved, and a long-standing bug in the display of plain text messages
 is fixed.
 
+<img src="mailflow_demo.png" height="900">
+
 Mail was once quite a good 'net citizen. It could be configured to generate
 plain text email, and would do so with the text neatly wrapped at 76
 columns. In addition, it used the RFC2646 format=flowed extension to
