@@ -43,7 +43,7 @@ unpack the source tar.gz file, change to the unpacked directory and run
 However, Apple carelessly broke their bundled py2app when implementing the
 System Integrity Protection feature in OS X 10.11 'El Capitan'. It is still
 broken in macOS 10.12 'Sierra' despite numerous bug reports. Until this is
-fixed, you first need to disable SIP by booting into recovery mode and
+fixed, you can disable SIP by booting into recovery mode and
 running 'csrutil disable', then boot back into OS X and remove the
 'restricted' flag from the system Python install with
 
@@ -51,9 +51,9 @@ running 'csrutil disable', then boot back into OS X and remove the
 
 Alternatively,
 
-  sudo chflags -R norestricted /
+  pip install --user --ignore-installed py2app
 
-will clear the 'restricted' file flags from the entire system.
+will install py2app locally to work around the restrictions without disabling SIP.
 
 Plugin bundles contain a list of UUIDs identifying versions of Mail with
 which they are compatible. The install.py script extracts the correct UUID
