@@ -1,7 +1,16 @@
 from distutils.core import setup
 import os
+import platform
 import py2app
+import shutil
 import sys
+
+def copystat(src, dst):
+    st = os.stat(src)
+    mode = shutil.stat.S_IMODE(st.st_mode)
+    os.utime(dst, (st.st_atime, st.st_mtime))
+    os.chmod(dst, mode)
+shutil.copystat = copystat
 
 install_path = os.environ["HOME"] + '/Library/Mail/Bundles'
 mail_path = '/Applications/Mail.app/Contents/Info'
@@ -13,6 +22,7 @@ if tuple(map(int, os.popen(command).read().strip().split('.'))) < (10, 0):
 
 command = 'defaults read %s PluginCompatibilityUUID' % mail_path
 compatibility_uuids = [ os.popen(command).read().strip() ]
+version = '.'.join(platform.mac_ver()[0].split('.')[:2])
 
 sys.argv[1:] = ['py2app'] + sys.argv[1:]
 sys.stdout = open(os.devnull, 'w')
@@ -29,8 +39,8 @@ setup(
                 'CFBundleIdentifier': 'uk.me.cdw.MailFlow',
                 'CFBundleVersion': '1.0',
                 'NSHumanReadableCopyright':
-                    'Copyright (C) 2016 Chris Webb <chris@arachsys.com>',
-                'Supported10.12PluginCompatibilityUUIDs':
+                    'Copyright (C) 2017 Chris Webb <chris@arachsys.com>',
+                'Supported%sPluginCompatibilityUUIDs' % version:
                     compatibility_uuids
             },
             'semi_standalone': True
